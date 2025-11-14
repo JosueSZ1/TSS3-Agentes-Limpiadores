@@ -1,7 +1,3 @@
-# file: cleaning_mesa.py
-# Run: python cleaning_mesa.py
-# Then open: http://127.0.0.1:8521
-
 import random
 from typing import Tuple, Dict, List, Optional
 
@@ -12,140 +8,172 @@ from mesa.datacollection import DataCollector
 from mesa.visualization.ModularVisualization import ModularServer
 from mesa.visualization.modules import CanvasGrid, ChartModule
 
-# ---------- Domain ----------
+# ---------- Dominio ----------
 Coord = Tuple[int, int]
-DIRS = {
-    "up":    (0, -1),
-    "down":  (0, 1),
-    "left":  (-1, 0),
-    "right": (1, 0),
+DIRECCIONES = {
+    "arriba":    (0, 1),
+    "abajo":     (0, -1),
+    "izquierda": (-1, 0),
+    "derecha":   (1, 0),
 }
-DIR_ORDER = ["up", "down", "left", "right"]
+ORDEN_DIRECCIONES = ["arriba", "abajo", "izquierda", "derecha"]
 
-
-# ---------- Agents ----------
-class Obstacle(Agent):
-    """Static obstacle that blocks movement."""
+# ---------- Agentes ----------
+class Obstaculo(Agent):
+    """Obstáculo estático que bloquea el movimiento."""
     def __init__(self, unique_id, model):
         super().__init__(unique_id, model)
 
-
-class Dirt(Agent):
-    """Dirt with a type and value. Cleaned when the cleaner is on the cell and chooses 'clean'."""
-    def __init__(self, unique_id, model, kind: str, value: int):
+class Suciedad(Agent):
+    """Suciedad con tipo y valor. Se limpia cuando el limpiador está en la celda y decide 'limpiar'."""
+    def __init__(self, unique_id, model, tipo: str, valor: int):
         super().__init__(unique_id, model)
-        self.kind = kind
-        self.value = value
+        self.tipo = tipo
+        self.valor = valor
 
-
-class MemoryCleaner(Agent):
+class LimpiadorConMemoria(Agent):
     """
-    Cleaner with:
-    - visited memory
-    - value-driven neighbor selection
-    - obstacle avoidance
-    Decision policy:
-      1) Clean if here dirty.
-      2) Move to adjacent highest-value dirt.
-      3) Explore unvisited valid neighbor.
-      4) Else any valid move.
-      5) Stay if no move.
+    Exploración con memoria suave:
+      1) limpiar si hay suciedad aquí
+      2) ir al vecino con mayor valor (empate -> ORDEN_DIRECCIONES)
+      3) explorar el vecino con MENOR número de visitas (empate -> ORDEN_DIRECCIONES)
+      4) si detecta bucle, pasar por el MÁS visitado
+      5) si no hay vecinos válidos -> quedarse
     """
-    def __init__(self, unique_id, model, start_pos: Coord):
+    def __init__(self, unique_id, model, start_pos):
         super().__init__(unique_id, model)
-        self.pos: Coord = start_pos
-        self.visited: set[Coord] = {start_pos}
-        self.collected_value: int = 0
-        self.cleaned_cells: int = 0
-        self.last_action: str = "init"
+        self.pos = start_pos
+        self.visited = {start_pos}
+        self.visit_count = {start_pos: 1}
+        self.valor_recogido = 0
+        self.celdas_limpiadas = 0
+        self.ultima_accion = "init"
 
-    # ---- Perception helpers ----
-    def _neighbors_info(self) -> List[Tuple[str, Coord, int]]:
+        # Para detección de bucles locales
+        self.historial = [start_pos]
+        self.max_historial = 12               # ventana de historia
+        self.umbral_bucle_unico = 4           # si hay <= 4 posiciones únicas en la ventana => bucle probable
+
+    def _informacion_vecinos(self):
+        """Obtiene información de los vecinos: dirección, posición, valor de suciedad."""
         info = []
-        for d in DIR_ORDER:
-            dx, dy = DIRS[d]
+        for d in ORDEN_DIRECCIONES:
+            dx, dy = DIRECCIONES[d]
             nx, ny = self.pos[0] + dx, self.pos[1] + dy
-            if not self.model.grid.out_of_bounds((nx, ny)):
-                # blocked by obstacle?
-                blocked = any(isinstance(a, Obstacle) for a in self.model.grid.get_cell_list_contents((nx, ny)))
-                if not blocked:
-                    # sum of values if multiple dirts in the same cell (rare but supported)
-                    v = 0
-                    for a in self.model.grid.get_cell_list_contents((nx, ny)):
-                        if isinstance(a, Dirt):
-                            v += a.value
-                    info.append((d, (nx, ny), v))
+            if self.model.grid.out_of_bounds((nx, ny)):
+                continue
+            # ¿Está bloqueado por un obstáculo?
+            if any(isinstance(a, Obstaculo) for a in self.model.grid.get_cell_list_contents((nx, ny))):
+                continue
+            # Sumar el valor total de suciedad en el vecino
+            valor_suciedad = 0
+            for a in self.model.grid.get_cell_list_contents((nx, ny)):
+                if isinstance(a, Suciedad):
+                    valor_suciedad += a.valor
+            info.append((d, (nx, ny), valor_suciedad))
         return info
 
-    def _here_dirty_value(self) -> int:
-        v = 0
+    def _valor_suciedad_aqui(self):
+        """Obtenemos el valor total de suciedad en la celda actual."""
+        valor = 0
         for a in self.model.grid.get_cell_list_contents(self.pos):
-            if isinstance(a, Dirt):
-                v += a.value
-        return v
+            if isinstance(a, Suciedad):
+                valor += a.valor
+        return valor
 
-    # ---- Decision ----
-    def decide(self) -> str:
-        here_v = self._here_dirty_value()
-        if here_v > 0:
-            return "clean"
+    def _es_bucle(self, candidate_next_pos=None):
+        """
+        Heurística simple de bucle:
+        - Pocos valores únicos en la ventana histórica
+        - O el siguiente movimiento vuelve a una de las últimas 4 posiciones
+        """
+        if len(self.historial) >= self.max_historial and len(set(self.historial[-self.max_historial:])) <= self.umbral_bucle_unico:
+            return True
+        if candidate_next_pos is not None:
+            recientes = set(self.historial[-4:])
+            if candidate_next_pos in recientes:
+                return True
+        return False
 
-        neighbors = self._neighbors_info()
+    def decidir(self):
+        """Lógica de decisión del limpiador."""
+        # 1) Limpiar si hay suciedad en la celda actual
+        if self._valor_suciedad_aqui() > 0:
+            return "limpiar"
 
-        dirt_neighbors = [(d, p, v) for d, p, v in neighbors if v > 0]
-        if dirt_neighbors:
-            dirt_neighbors.sort(key=lambda t: (-t[2], DIR_ORDER.index(t[0])))
-            return dirt_neighbors[0][0]
+        vecinos = self._informacion_vecinos()
+        if not vecinos:
+            return "quedarse"
 
-        unvisited = [(d, p) for d, p, v in neighbors if p not in self.visited]
-        if unvisited:
-            unvisited.sort(key=lambda t: DIR_ORDER.index(t[0]))
-            return unvisited[0][0]
+        # 2) Priorizar la suciedad adyacente con mayor valor
+        vecinos_con_suciedad = [(d, p, v) for d, p, v in vecinos if v > 0]
+        if vecinos_con_suciedad:
+            vecinos_con_suciedad.sort(key=lambda t: (-t[2], ORDEN_DIRECCIONES.index(t[0])))
+            mejor_direccion, mejor_pos, _ = vecinos_con_suciedad[0]
+            if self._es_bucle(candidate_next_pos=mejor_pos):
+                return self._direccion_mas_visitada(vecinos)
+            return mejor_direccion
 
-        if neighbors:
-            neighbors.sort(key=lambda t: DIR_ORDER.index(t[0]))
-            return neighbors[0][0]
+        # 3) Explorar el vecino menos visitado
+        vecinos.sort(key=lambda nb: (self.visit_count.get(nb[1], 0), ORDEN_DIRECCIONES.index(nb[0])))
+        mejor_direccion, mejor_pos, _ = vecinos[0]
 
-        return "stay"
+        # 4) Si se detecta bucle, se elige la alternativa más visitada
+        if self._es_bucle(candidate_next_pos=mejor_pos):
+            return self._direccion_mas_visitada(vecinos)
 
-    # ---- Act ----
+        return mejor_direccion
+
+    def _direccion_mas_visitada(self, vecinos):
+        """
+        Romper atascos: elegir el vecino con mayor visit_count (en caso de empate, usar ORDEN_DIRECCIONES).
+        """
+        vecinos_ordenados = sorted(
+            vecinos,
+            key=lambda nb: (-self.visit_count.get(nb[1], 0), ORDEN_DIRECCIONES.index(nb[0]))
+        )
+        return vecinos_ordenados[0][0]
+
     def step(self):
-        action = self.decide()
-        self.last_action = action
+        """Realiza un paso de simulación."""
+        accion = self.decidir()
+        self.ultima_accion = accion
 
-        if action == "clean":
-            # remove all dirts in the current cell, accumulate values
-            cell_agents = list(self.model.grid.get_cell_list_contents(self.pos))
-            gained = 0
-            for a in cell_agents:
-                if isinstance(a, Dirt):
-                    gained += a.value
+        if accion == "limpiar":
+            agentes_en_celda = list(self.model.grid.get_cell_list_contents(self.pos))
+            ganado = 0
+            for a in agentes_en_celda:
+                if isinstance(a, Suciedad):
+                    ganado += a.valor
                     self.model.grid.remove_agent(a)
                     self.model.dirt_count -= 1
-            if gained > 0:
-                self.collected_value += gained
-                self.cleaned_cells += 1
-        elif action in DIRS:
-            dx, dy = DIRS[action]
+            if ganado > 0:
+                self.valor_recogido += ganado
+                self.celdas_limpiadas += 1
+        elif accion in DIRECCIONES:
+            dx, dy = DIRECCIONES[accion]
             nx, ny = self.pos[0] + dx, self.pos[1] + dy
-            # safe move (neighbors list already excludes obstacles/out-of-bounds)
             self.model.grid.move_agent(self, (nx, ny))
             self.pos = (nx, ny)
+
+            # Memoria suave
             self.visited.add(self.pos)
+            self.visit_count[self.pos] = self.visit_count.get(self.pos, 0) + 1
+            self.historial.append(self.pos)
+            if len(self.historial) > self.max_historial:
+                self.historial.pop(0)
         else:
-            # stay
             pass
 
-
-# ---------- Model ----------
-class CleaningModel(Model):
+# ---------- Modelo ----------
+class ModeloLimpieza(Model):
     """
-    ABM with:
-    - MultiGrid and RandomActivation
-    - Multiple Dirt agents with types/values
-    - Static Obstacle agents
-    - One MemoryCleaner agent
-    DataCollector tracks: remaining dirt, collected value, cleaned cells, step
+    ABM con:
+    - MultiGrid y RandomActivation
+    - Varios agentes de Suciedad con tipos y valores
+    - Agentes Obstáculo estáticos
+    - Un agente Limpiador con Memoria
+    - DataCollector para seguir el progreso
     """
     def __init__(
         self,
@@ -162,58 +190,58 @@ class CleaningModel(Model):
         self.grid = MultiGrid(width, height, torus=False)
         self.random = random.Random(seed)
 
-        # dirt catalog
-        self.dirt_catalog: Dict[str, Dict] = {
-            "dust":   {"value": 1, "color": "#9aa0a6"},
-            "crumb":  {"value": 2, "color": "#4285f4"},
-            "spill":  {"value": 3, "color": "#ea4335"},
+        # Catálogo de suciedad
+        self.catalogo_suciedad: Dict[str, Dict] = {
+            "polvo":   {"valor": 1, "color": "#9aa0a6"},
+            "migaja":  {"valor": 2, "color": "#4285f4"},
+            "derrame": {"valor": 3, "color": "#ea4335"},
         }
 
-        # place obstacles
-        self.obstacle_ids: List[int] = []
-        placed = 0
-        while placed < num_obstacles:
+        # Colocando obstáculos
+        self.ids_obstaculos: List[int] = []
+        colocado = 0
+        while colocado < num_obstacles:
             x, y = self.random.randrange(self.width), self.random.randrange(self.height)
-            if any(isinstance(a, Obstacle) for a in self.grid.get_cell_list_contents((x, y))):
+            if any(isinstance(a, Obstaculo) for a in self.grid.get_cell_list_contents((x, y))):
                 continue
-            a = Obstacle(self.next_id(), self)
+            a = Obstaculo(self.next_id(), self)
             self.grid.place_agent(a, (x, y))
-            self.obstacle_ids.append(a.unique_id)
-            placed += 1
+            self.ids_obstaculos.append(a.unique_id)
+            colocado += 1
 
-        # place dirt (avoid obstacle cells)
-        self.dirt_ids: List[int] = []
+        # Colocando suciedad (evitando obstáculos)
+        self.ids_suciedad: List[int] = []
         self.dirt_count: int = 0
-        placed = 0
-        while placed < num_dirt:
+        colocado = 0
+        while colocado < num_dirt:
             x, y = self.random.randrange(self.width), self.random.randrange(self.height)
-            cell_agents = self.grid.get_cell_list_contents((x, y))
-            if any(isinstance(a, Obstacle) for a in cell_agents):
+            agentes_celda = self.grid.get_cell_list_contents((x, y))
+            if any(isinstance(a, Obstaculo) for a in agentes_celda):
                 continue
-            kind = self.random.choice(list(self.dirt_catalog.keys()))
-            val = self.dirt_catalog[kind]["value"]
-            d = Dirt(self.next_id(), self, kind=kind, value=val)
-            self.grid.place_agent(d, (x, y))
-            self.dirt_ids.append(d.unique_id)
+            tipo = self.random.choice(list(self.catalogo_suciedad.keys()))
+            valor = self.catalogo_suciedad[tipo]["valor"]
+            s = Suciedad(self.next_id(), self, tipo=tipo, valor=valor)
+            self.grid.place_agent(s, (x, y))
+            self.ids_suciedad.append(s.unique_id)
             self.dirt_count += 1
-            placed += 1
+            colocado += 1
 
-        # place cleaner on a free cell
+        # Colocando el limpiador en una celda libre
         while True:
             sx, sy = self.random.randrange(self.width), self.random.randrange(self.height)
-            if not any(isinstance(a, Obstacle) for a in self.grid.get_cell_list_contents((sx, sy))):
+            if not any(isinstance(a, Obstaculo) for a in self.grid.get_cell_list_contents((sx, sy))):
                 break
-        self.cleaner = MemoryCleaner(self.next_id(), self, start_pos=(sx, sy))
-        self.grid.place_agent(self.cleaner, (sx, sy))
-        self.schedule.add(self.cleaner)
+        self.limpiador = LimpiadorConMemoria(self.next_id(), self, start_pos=(sx, sy))
+        self.grid.place_agent(self.limpiador, (sx, sy))
+        self.schedule.add(self.limpiador)
 
         self.step_count = 0
         self.datacollector = DataCollector(
             model_reporters={
-                "remaining_dirt": lambda m: m.dirt_count,
-                "collected_value": lambda m: m.cleaner.collected_value,
-                "cleaned_cells": lambda m: m.cleaner.cleaned_cells,
-                "step": lambda m: m.step_count,
+                "suciedad_restante": lambda m: m.dirt_count,
+                "valor_recogido": lambda m: m.limpiador.valor_recogido,
+                "celdas_limpiadas": lambda m: m.limpiador.celdas_limpiadas,
+                "paso": lambda m: m.step_count,
             }
         )
 
@@ -222,31 +250,31 @@ class CleaningModel(Model):
         self.step_count += 1
         self.datacollector.collect(self)
 
-    # stopping rule example (optional)
-    def all_clean(self) -> bool:
+    # Regla de parada (opcional)
+    def todo_limpio(self) -> bool:
         return self.dirt_count == 0
 
 
-# ---------- Visualization ----------
-def portrayal(agent: Agent) -> Dict:
+# ---------- Visualización ----------
+def presentación(agent: Agent) -> Dict:
+    """Definición visual para cada agente en el grid."""
     if agent is None:
         return {}
 
-    # base portrayal
+    # visualización base
     p = {"Shape": "rect", "w": 1, "h": 1, "Filled": "true", "Layer": 0}
 
-    if isinstance(agent, Obstacle):
-        p.update({"Color": "#202124"})  # dark gray
-    elif isinstance(agent, Dirt):
-        # color by type
-        # we cannot access model.dirt_catalog directly here safely, so simple mapping
+    if isinstance(agent, Obstaculo):
+        p.update({"Color": "#202124"})  # gris oscuro
+    elif isinstance(agent, Suciedad):
+        # color según tipo
         color_map = {
-            "dust": "#9aa0a6",
-            "crumb": "#4285f4",
-            "spill": "#ea4335",
+            "polvo": "#9aa0a6",
+            "migaja": "#4285f4",
+            "derrame": "#ea4335",
         }
-        p.update({"Color": color_map.get(agent.kind, "#9aa0a6"), "Layer": 1})
-    elif isinstance(agent, MemoryCleaner):
+        p.update({"Color": color_map.get(agent.tipo, "#9aa0a6"), "Layer": 1})
+    elif isinstance(agent, LimpiadorConMemoria):
         p.update({"Shape": "circle", "r": 0.5, "Color": "#34a853", "Layer": 2})
     else:
         p.update({"Color": "#ffffff"})
@@ -254,22 +282,22 @@ def portrayal(agent: Agent) -> Dict:
     return p
 
 
-def run_server(width=10, height=10, num_dirt=18, num_obstacles=15, seed=42):
-    grid_vis = CanvasGrid(portrayal, width, height, 600, 600)
+def correr_servidor(width=10, height=10, num_dirt=15, num_obstacles=15, seed=42):
+    grid_vis = CanvasGrid(presentación, width, height, 600, 600)
 
     chart = ChartModule(
         [
-            {"Label": "remaining_dirt", "Color": "black"},
-            {"Label": "collected_value", "Color": "blue"},
-            {"Label": "cleaned_cells", "Color": "red"},
+            {"Label": "suciedad_restante", "Color": "black"},
+            {"Label": "valor_recogido", "Color": "blue"},
+            {"Label": "celdas_limpiadas", "Color": "red"},
         ],
         data_collector_name="datacollector",
     )
 
-    server = ModularServer(
-        CleaningModel,
+    servidor = ModularServer(
+        ModeloLimpieza,
         [grid_vis, chart],
-        "Cleaning ABM: Memory + Multi-dirt + Obstacles",
+        "Modelo de Limpieza ABM: Memoria + Suciedad + Obstáculos",
         {
             "width": width,
             "height": height,
@@ -278,9 +306,9 @@ def run_server(width=10, height=10, num_dirt=18, num_obstacles=15, seed=42):
             "seed": seed,
         },
     )
-    server.port = 8521
-    server.launch()
+    servidor.port = 8521
+    servidor.launch()
 
 
 if __name__ == "__main__":
-    run_server()
+    correr_servidor()
