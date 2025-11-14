@@ -1,11 +1,30 @@
 import random
 from typing import Tuple, Dict, List, Optional
+
 from mesa import Agent, Model
 from mesa.time import RandomActivation
 from mesa.space import MultiGrid
 from mesa.datacollection import DataCollector
 from mesa.visualization.ModularVisualization import ModularServer
 from mesa.visualization.modules import CanvasGrid, ChartModule
+
+COLORES_AGENTES = [
+    "#34a853",  # verde
+    "#4285f4",  # azul
+    "#ea4335",  # rojo
+    "#fbbc05",  # amarillo
+    "#9c27b0",  # púrpura
+    "#ff5722",  # naranja
+]
+
+COLORES_AGENTES_NOMBRES = [
+    "verde",
+    "azul",
+    "rojo",
+    "amarillo",
+    "purpura",
+    "naranja",
+]
 
 # ---------- Dominio ----------
 Coordenada = Tuple[int, int]
@@ -36,23 +55,25 @@ class AgenteRecolector(Agent):
     Agente recolector que:
       - Compite por comida limitada.
       - Se comunica con otros para evitar ir al mismo objetivo.
-
-    Protocolo sencillo:
-      * Comparte posiciones de comida que ve: mensaje tipo 'comida_encontrada'.
-      * Cuando toma un objetivo, envía 'objetivo_tomado' con la posición.
-      * Cada agente evita elegir objetivos que están marcados como tomados.
+      - Usa una memoria ligera para evitar bucles y reducir aleatoriedad.
     """
 
-    def __init__(self, unique_id, model, start_pos: Coordenada):
+    def __init__(self, unique_id, model, start_pos: Coordenada, color_index: int):
         super().__init__(unique_id, model)
         self.pos = start_pos
+        self.color_index = color_index
         self.objetivo: Optional[Coordenada] = None
         self.buzon: List[Dict] = []
         self.comida_recolectada: int = 0
         # Conjunto local de objetivos que se asume ya están tomados por alguien
         self.objetivos_reservados: set[Coordenada] = set()
 
-    # --- Comunicación ---
+        # --- Memoria para evitar bucles ---
+        self.visit_count: Dict[Coordenada, int] = {start_pos: 1}
+        self.history: List[Coordenada] = [start_pos]
+        self.max_history: int = 10  # tamaño de ventana reciente
+
+    # ---------- Comunicación ----------
     def enviar_mensaje(self, destinatarios: List["AgenteRecolector"], tipo: str, contenido):
         for agente in destinatarios:
             agente.recibir_mensaje(self.unique_id, tipo, contenido)
@@ -80,14 +101,60 @@ class AgenteRecolector(Agent):
         self.buzon.clear()
         return comida_reportada
 
-    # --- Percepción ---
+    # ---------- Percepción ----------
     def percibir_comida(self, radio: int = 3) -> List[Coordenada]:
         """
         Devuelve posiciones de comida dentro de un radio de visión (distancia Manhattan).
         """
         return self.model.obtener_comida_cercana(self.pos, radio)
 
-    # --- Decisión + Acción ---
+    # ---------- Memoria de movimiento ----------
+    def _registrar_posicion(self):
+        """Actualiza contador de visitas e historial de posiciones."""
+        self.visit_count[self.pos] = self.visit_count.get(self.pos, 0) + 1
+        self.history.append(self.pos)
+        if len(self.history) > self.max_history:
+            self.history.pop(0)
+
+    def _vecinos_libres(self) -> List[Tuple[str, Coordenada]]:
+        """Devuelve (nombre_dirección, posición) de vecinos libres (sin obstáculo)."""
+        vecinos: List[Tuple[str, Coordenada]] = []
+        for d in ORDEN_DIRECCIONES:
+            dx, dy = DIRECCIONES[d]
+            nx, ny = self.pos[0] + dx, self.pos[1] + dy
+            if self.model.es_celda_libre((nx, ny)):
+                vecinos.append((d, (nx, ny)))
+        return vecinos
+
+    def _elegir_vecino_exploratorio(self) -> Optional[str]:
+        """
+        Elige un vecino para explorar:
+          1) Preferir posiciones que NO estén en el historial reciente.
+          2) Entre ellas, la MENOS visitada.
+          3) Si todos son recientes, igual elegir la MENOS visitada.
+        Devuelve la dirección (str) o None si no hay vecinos.
+        """
+        vecinos = self._vecinos_libres()
+        if not vecinos:
+            return None
+
+        recientes = set(self.history[-4:])  # ventana de “reciente” más pequeña
+
+        # Vecinos que no están en historial reciente
+        candidatos = [v for v in vecinos if v[1] not in recientes]
+        if not candidatos:
+            candidatos = vecinos
+
+        # Ordenar por (visit_count, orden de direcciones) y tomar el mejor
+        candidatos.sort(
+            key=lambda item: (
+                self.visit_count.get(item[1], 0),
+                ORDEN_DIRECCIONES.index(item[0])
+            )
+        )
+        return candidatos[0][0]
+
+    # ---------- Decisión ----------
     def elegir_objetivo(self, opciones: List[Coordenada]) -> Optional[Coordenada]:
         """
         Elige el objetivo más cercano que no esté reservado por otros agentes.
@@ -105,13 +172,13 @@ class AgenteRecolector(Agent):
         return min(libres, key=lambda p: abs(p[0] - x) + abs(p[1] - y))
 
     def mover_hacia(self, destino: Coordenada):
-        """Movimiento greedy en rejilla (una celda por paso) evitando obstáculos y bordes."""
+        """Movimiento greedy en rejilla (una celda por paso) evitando obstáculos y bordes, con salida menos aleatoria."""
         x, y = self.pos
         tx, ty = destino
 
         candidatos: List[Coordenada] = []
 
-        # Priorizamos eje x, luego eje y (puedes ajustar esto si quieres)
+        # Priorizamos eje x, luego eje y (como antes)
         if tx > x:
             candidatos.append((x + 1, y))
         elif tx < x:
@@ -121,24 +188,40 @@ class AgenteRecolector(Agent):
         elif ty < y:
             candidatos.append((x, y - 1))
 
-        # Elegir el primer candidato válido y sin obstáculo
+        # Intentar avanzar hacia el objetivo
         for nx, ny in candidatos:
             if self.model.es_celda_libre((nx, ny)):
                 self.model.grid.move_agent(self, (nx, ny))
                 return
 
-        # Si no puede avanzar hacia el objetivo, moverse aleatoriamente (si hay celda libre)
-        dx, dy = random.choice(list(DIRECCIONES.values()))
-        nx, ny = x + dx, y + dy
-        if self.model.es_celda_libre((nx, ny)):
+        # Si no puede avanzar hacia el objetivo, usar exploración dirigida
+        dir_explo = self._elegir_vecino_exploratorio()
+        if dir_explo is not None:
+            dx, dy = DIRECCIONES[dir_explo]
+            nx, ny = x + dx, y + dy
             self.model.grid.move_agent(self, (nx, ny))
+            return
+        # Si ni siquiera hay vecinos libres, se queda quieto
 
     def step(self):
         """Llamado automáticamente por el scheduler de Mesa en cada tick."""
+        # Registrar posición actual en memoria (contadores e historial)
+        self._registrar_posicion()
+
         # Otros agentes (para comunicarme)
         otros: List[AgenteRecolector] = [
             a for a in self.model.agentes if a.unique_id != self.unique_id
         ]
+
+        # 0) Siempre que haya comida en la celda actual, recogerla
+        if self.model.recolectar_comida(self.pos):
+            self.comida_recolectada += 1
+            # Si justo era mi objetivo, ya no tiene sentido seguirlo
+            if self.objetivo == self.pos:
+                self.objetivo = None
+            # Opcional: avisar que este objetivo ya fue tomado
+            if otros:
+                self.enviar_mensaje(otros, "objetivo_tomado", self.pos)
 
         # 1) Procesar mensajes
         comida_compartida = self.procesar_mensajes()
@@ -164,23 +247,19 @@ class AgenteRecolector(Agent):
 
         # 5) Actuar según el objetivo
         if self.objetivo is not None:
-            # Si ya estoy en el objetivo, intento recolectar
             if self.pos == self.objetivo:
-                if self.model.recolectar_comida(self.pos):
-                    self.comida_recolectada += 1
-                # Libero el objetivo (ya no tiene comida)
+                # La comida ya se recoge en el paso 0, aquí solo liberamos objetivo
                 self.objetivo = None
             else:
-                # Moverme hacia el objetivo
                 self.mover_hacia(self.objetivo)
         else:
-            # Si no tengo objetivo, paseo aleatorio
-            x, y = self.pos
-            dx, dy = random.choice(list(DIRECCIONES.values()))
-            nx, ny = x + dx, y + dy
-            if self.model.es_celda_libre((nx, ny)):
+            # Sin objetivo: explorar de forma dirigida (no puramente aleatoria)
+            dir_explo = self._elegir_vecino_exploratorio()
+            if dir_explo is not None:
+                dx, dy = DIRECCIONES[dir_explo]
+                nx, ny = self.pos[0] + dx, self.pos[1] + dy
                 self.model.grid.move_agent(self, (nx, ny))
-
+            # Si no hay vecinos libres, se queda donde está
 
 # ---------- Modelo ----------
 class ModeloRecolectoresCompetitivos(Model):
@@ -216,32 +295,51 @@ class ModeloRecolectoresCompetitivos(Model):
         while colocada < num_comida:
             x = self.random.randrange(self.width)
             y = self.random.randrange(self.height)
-            if any(isinstance(a, Obstaculo) for a in self.grid.get_cell_list_contents((x, y))):
+            contenido = self.grid.get_cell_list_contents((x, y))
+
+            # Evitar celdas con obstáculos o con comida ya colocada
+            if any(isinstance(a, Obstaculo) for a in contenido):
                 continue
+            if any(isinstance(a, Comida) for a in contenido):
+                continue
+
             comida = Comida(self.next_id(), self, valor=1)
             self.grid.place_agent(comida, (x, y))
             colocada += 1
             self.comida_restante += 1
 
         # ----- Colocar agentes recolectores -----
-        for _ in range(num_agentes):
+        for i in range(num_agentes):
             while True:
                 x = self.random.randrange(self.width)
                 y = self.random.randrange(self.height)
                 if any(isinstance(a, Obstaculo) for a in self.grid.get_cell_list_contents((x, y))):
                     continue
-                agente = AgenteRecolector(self.next_id(), self, (x, y))
+                agente = AgenteRecolector(self.next_id(), self, (x, y), color_index=i)
                 self.grid.place_agent(agente, (x, y))
                 self.schedule.add(agente)
                 self.agentes.append(agente)
                 break
 
-        self.datacollector = DataCollector(
-            model_reporters={
-                "comida_restante": lambda m: m.comida_restante,
-                "comida_recolectada_total": lambda m: sum(a.comida_recolectada for a in m.agentes),
-            }
-        )
+
+        # Reporte base: comida restante
+        reporters = {
+            "comida_restante": lambda m: m.comida_restante,
+        }
+
+        # Agregar dinámicamente un reporte por cada agente:
+        # comida_verde, comida_azul, comida_rojo, ...
+        for idx, agente in enumerate(self.agentes):
+            color_nombre = COLORES_AGENTES_NOMBRES[idx % len(COLORES_AGENTES_NOMBRES)]
+            clave = f"comida_{color_nombre}"
+
+            # Captura segura del id del agente en la lambda
+            reporters[clave] = (lambda a_id: (
+                lambda m: next(ag.comida_recolectada for ag in m.agentes if ag.unique_id == a_id)
+            ))(agente.unique_id)
+
+        self.datacollector = DataCollector(model_reporters=reporters)
+
 
     def step(self):
         self.schedule.step()
@@ -300,20 +398,27 @@ def presentacion(agent: Agent) -> Dict:
     elif isinstance(agent, Comida):
         portrayal.update({"Color": "#ffcc00", "Layer": 1})
     elif isinstance(agent, AgenteRecolector):
-        portrayal.update({"Shape": "circle", "Color": "#34a853", "Layer": 2, "r": 0.6})
+        color = COLORES_AGENTES[agent.color_index % len(COLORES_AGENTES)]
+        portrayal.update({"Shape": "circle", "Color": color, "Layer": 2, "r": 0.6})
     return portrayal
 
 
-def correr_servidor(width=10, height=10, num_comida=15, num_obstaculos=10, num_agentes=3, seed=42):
+def correr_servidor(width=10, height=10, num_comida=15, num_obstaculos=5, num_agentes=3, seed=42):
     """Lanza el servidor para la visualización de la simulación."""
     grid_vis = CanvasGrid(presentacion, width, height, 600, 600)
-    chart = ChartModule(
-        [
-            {"Label": "comida_restante", "Color": "black"},
-            {"Label": "comida_recolectada_total", "Color": "blue"},
-        ],
-        data_collector_name="datacollector",
-    )
+     # Serie base: comida restante
+    chart_series = [
+        {"Label": "comida_restante", "Color": "black"},
+    ]
+
+    for idx in range(num_agentes):
+        color_hex = COLORES_AGENTES[idx % len(COLORES_AGENTES)]
+        color_nombre = COLORES_AGENTES_NOMBRES[idx % len(COLORES_AGENTES_NOMBRES)]
+        chart_series.append({
+            "Label": f"comida_{color_nombre}",
+            "Color": color_hex,   # <-- usar el mismo color HEX del agente
+        })
+    chart = ChartModule(chart_series, data_collector_name="datacollector")
 
     servidor = ModularServer(
         ModeloRecolectoresCompetitivos,

@@ -75,16 +75,31 @@ class AgenteConMemoria(Agent):
                 return True
         return False
 
-    def _direccion_mas_visitada(self, vecinos):
-        """
-        Romper atascos: elegir el vecino con mayor visit_count (en caso de empate, usar ORDEN_DIRECCIONES).
-        """
-        # Ordena los vecinos por el número de veces que fueron visitados (más visitados primero)
-        vecinos_ordenados = sorted(
-            vecinos,
-            key=lambda nb: (-self.visit_count.get(nb[1], 0), ORDEN_DIRECCIONES.index(nb[0]))
-        )
-        return vecinos_ordenados[0][0]
+    def _romper_bucle(self, vecinos):
+            """
+            Romper bucles:
+            1) Preferir vecinos cuya posición NO esté en el historial reciente.
+            2) Entre ellos, elegir el MENOS visitado.
+            3) Si todos están en el historial reciente, elegir el MENOS visitado igualmente.
+            """
+            recientes = set(self.historial[-4:])  # ventana más corta para 'reciente'
+
+            # Vecinos que NO están en el historial reciente
+            candidatos = [nb for nb in vecinos if nb[1] not in recientes]
+
+            # Si todos los vecinos están en el historial reciente, usamos todos
+            if not candidatos:
+                candidatos = list(vecinos)
+
+            # Elegir el menos visitado (empate -> ORDEN_DIRECCIONES)
+            candidatos.sort(
+                key=lambda nb: (
+                    self.visit_count.get(nb[1], 0),
+                    ORDEN_DIRECCIONES.index(nb[0])
+                )
+            )
+            # Devolvemos solo la dirección
+            return candidatos[0][0]
 
     def decidir(self):
         """Decisión del agente para moverse hacia el área con más comida y salir de un bucle si es necesario."""
@@ -105,7 +120,7 @@ class AgenteConMemoria(Agent):
 
             # Si está en un bucle, mover al vecino con el menor peso
             if self._es_bucle(candidate_next_pos=mejor_pos):
-                return self._direccion_mas_visitada(vecinos)
+                return self._romper_bucle(vecinos)
             return mejor_direccion
 
         # 3) Si no hay comida visible, moverse hacia el vecino menos visitado
@@ -114,7 +129,7 @@ class AgenteConMemoria(Agent):
 
         # 4) Si se detecta un bucle en la dirección seleccionada, moverse al vecino más visitado
         if self._es_bucle(candidate_next_pos=mejor_pos):
-            return self._direccion_mas_visitada(vecinos)
+            return self._romper_bucle(vecinos)
 
         return mejor_direccion
 

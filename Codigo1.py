@@ -111,7 +111,7 @@ class LimpiadorConMemoria(Agent):
             vecinos_con_suciedad.sort(key=lambda t: (-t[2], ORDEN_DIRECCIONES.index(t[0])))
             mejor_direccion, mejor_pos, _ = vecinos_con_suciedad[0]
             if self._es_bucle(candidate_next_pos=mejor_pos):
-                return self._direccion_mas_visitada(vecinos)
+                return self._romper_bucle(vecinos)
             return mejor_direccion
 
         # 3) Explorar el vecino menos visitado
@@ -120,20 +120,35 @@ class LimpiadorConMemoria(Agent):
 
         # 4) Si se detecta bucle, se elige la alternativa más visitada
         if self._es_bucle(candidate_next_pos=mejor_pos):
-            return self._direccion_mas_visitada(vecinos)
+            return self._romper_bucle(vecinos)
 
         return mejor_direccion
 
-    def _direccion_mas_visitada(self, vecinos):
-        """
-        Romper atascos: elegir el vecino con mayor visit_count (en caso de empate, usar ORDEN_DIRECCIONES).
-        """
-        vecinos_ordenados = sorted(
-            vecinos,
-            key=lambda nb: (-self.visit_count.get(nb[1], 0), ORDEN_DIRECCIONES.index(nb[0]))
-        )
-        return vecinos_ordenados[0][0]
+    def _romper_bucle(self, vecinos):
+            """
+            Romper bucles:
+            1) Preferir vecinos cuya posición NO esté en el historial reciente.
+            2) Entre ellos, elegir el MENOS visitado.
+            3) Si todos están en el historial reciente, elegir el MENOS visitado igualmente.
+            """
+            recientes = set(self.historial[-4:])  # ventana más corta para 'reciente'
 
+            # Vecinos que NO están en el historial reciente
+            candidatos = [nb for nb in vecinos if nb[1] not in recientes]
+
+            # Si todos los vecinos están en el historial reciente, usamos todos
+            if not candidatos:
+                candidatos = list(vecinos)
+
+            # Elegir el menos visitado (empate -> ORDEN_DIRECCIONES)
+            candidatos.sort(
+                key=lambda nb: (
+                    self.visit_count.get(nb[1], 0),
+                    ORDEN_DIRECCIONES.index(nb[0])
+                )
+            )
+            # Devolvemos solo la dirección
+            return candidatos[0][0]
     def step(self):
         """Realiza un paso de simulación."""
         accion = self.decidir()
@@ -175,14 +190,7 @@ class ModeloLimpieza(Model):
     - Un agente Limpiador con Memoria
     - DataCollector para seguir el progreso
     """
-    def __init__(
-        self,
-        width: int = 10,
-        height: int = 10,
-        num_dirt: int = 18,
-        num_obstacles: int = 15,
-        seed: Optional[int] = 42
-    ):
+    def __init__(self, width: int = 10, height: int = 10, num_dirt: int = 18, num_obstacles: int = 15, seed: Optional[int] = 42):
         super().__init__(seed=seed)
         self.width = width
         self.height = height
